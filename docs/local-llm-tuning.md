@@ -31,6 +31,8 @@ The context window primarily impacts **RAM usage via the KV cache**.
 **Rule of thumb:**  
 Prefer *moderate context + good summarization* over extreme context sizes.
 
+**Measure, don’t guess:** Watch memory + swap (Activity Monitor / LM Studio stats). If swap increases or tokens/sec collapses under load, reduce `contextWindow` or concurrency.
+
 ---
 
 ### 2. Max Tokens per Response (`maxTokens`)
@@ -66,6 +68,9 @@ For agent-style workloads (coding, tools, analysis):
 Lower temperature is recommended for code and factual tasks.  
 Higher temperature increases creativity but also error risk.
 
+Note: Repeat penalty is engine-dependent. Start low (≈1.05). If code formatting degrades, disable it.
+
+
 ---
 
 ### 4. Tool Output Management (Context Hygiene)
@@ -95,6 +100,23 @@ This preserves:
 - task continuity  
 - memory efficiency  
 - reasoning quality  
+
+Example (OpenClaw): enable pruning so old tool results don’t fill the context window:
+
+```jsonc
+{
+  "agents": {
+    "defaults": {
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "5m",
+        "softTrim": { "maxChars": 4000, "headChars": 1500, "tailChars": 1500 },
+        "hardClear": { "enabled": true, "placeholder": "[old tool result content cleared]" }
+      }
+    }
+  }
+}
+```
 
 ---
 
