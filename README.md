@@ -342,6 +342,10 @@ docker exec -it openclaw-openclaw-gateway-1 sh -lc "curl http://192.168.1.10 || 
 
 ---
 
+## 14. Local LLM Tuning (LM Studio) (Important Insights)
+
+See: [Local LLM Tuning](docs/local-llm-tuning.md)
+
 ## 🎉 Result
 
 This setup provides:
