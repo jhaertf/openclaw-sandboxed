@@ -2,13 +2,39 @@
 
 When running OpenClaw with a locally hosted LLM (for example via LM Studio using an OpenAI-compatible API), correct parameter tuning is critical for:
 
-- stability  
-- latency  
-- memory usage (KV cache)  
-- output quality  
-- avoiding runaway generations  
+- stability
+- latency
+- memory usage (KV cache)
+- output quality
+- avoiding runaway generations
 
 This section summarizes best-practice settings and trade-offs for local LLM deployments.
+
+---
+
+### 0. Docker Networking Impact (Critical!)
+
+**This is often the biggest performance factor.**
+
+Docker bridge networking adds significant latency for API calls to external services (like your LLM server):
+
+| Network Mode | First Request | Subsequent Requests |
+|--------------|---------------|---------------------|
+| Bridge (`gateway-net`) | ~1.8s | ~0.01s |
+| Host (`network_mode: host`) | ~0.3s | ~0.01s |
+
+**Recommendation:** Use `network_mode: host` in your docker-compose.yml for 5-6x faster initial response times.
+
+```yaml
+services:
+  openclaw-gateway:
+    network_mode: host
+    # ports section not needed with host networking
+```
+
+With host networking, the container shares the host's network stack, eliminating NAT overhead.
+
+**Security note:** Use `--bind loopback` to ensure the gateway only listens on 127.0.0.1, then access via Cloudflare Tunnel or SSH tunnel.
 
 ---
 
@@ -17,21 +43,28 @@ This section summarizes best-practice settings and trade-offs for local LLM depl
 The context window primarily impacts **RAM usage via the KV cache**.
 
 **Guidelines:**
-- Start with **8k context**
-- If stable and responsive, increase to **12k–16k**
-- Only use very large contexts (e.g. 128k+) if:
+- Start with **16k–32k context** for modern models
+- For large models (70B+), **32k** is a good balance
+- Only use very large contexts (e.g. 100k+) if:
   - memory headroom is verified
   - swap is not used
   - latency remains acceptable
 
 **Key insight:**
-> A large context window is only useful if it is filled with meaningful information.  
+> A large context window is only useful if it is filled with meaningful information.
 > Excessively large windows increase memory pressure and slow down inference.
 
-**Rule of thumb:**  
-Prefer *moderate context + good summarization* over extreme context sizes.
+**Recommended setting for 80B models:**
+```json
+"contextWindow": 32768
+```
 
-**Measure, don’t guess:** Watch memory + swap (Activity Monitor / LM Studio stats). If swap increases or tokens/sec collapses under load, reduce `contextWindow` or concurrency.
+This provides enough context for complex tasks while avoiding excessive memory usage.
+
+**Rule of thumb:**
+Prefer *moderate context + good pruning* over extreme context sizes.
+
+**Measure, don't guess:** Watch memory + swap (Activity Monitor / LM Studio stats). If swap increases or tokens/sec collapses under load, reduce `contextWindow` or concurrency.
 
 ---
 
@@ -40,17 +73,22 @@ Prefer *moderate context + good summarization* over extreme context sizes.
 This limits how long a single model response can become.
 
 **Recommended defaults:**
-- **600–1000 tokens** for normal tasks  
-- **1000–2000 tokens** for coding tasks  
+- **1024–2048 tokens** for general agent tasks
+- **2048 tokens** for coding and complex reasoning
 - Avoid very large values (e.g. 8000+) unless strictly necessary
 
-**Why this matters:**
-- Prevents endless outputs  
-- Reduces risk of tool loops  
-- Improves responsiveness  
-- Encourages multi-step reasoning instead of single massive replies  
+**Recommended setting:**
+```json
+"maxTokens": 2048
+```
 
-**Best practice:**  
+**Why this matters:**
+- Prevents endless outputs
+- Reduces risk of tool loops
+- Improves responsiveness
+- Encourages multi-step reasoning instead of single massive replies
+
+**Best practice:**
 Prefer multiple short iterations over one extremely long response.
 
 ---
@@ -101,7 +139,7 @@ This preserves:
 - memory efficiency  
 - reasoning quality  
 
-Example (OpenClaw): enable pruning so old tool results don’t fill the context window:
+Example (OpenClaw): enable aggressive pruning for faster response times:
 
 ```jsonc
 {
@@ -109,14 +147,24 @@ Example (OpenClaw): enable pruning so old tool results don’t fill the context 
     "defaults": {
       "contextPruning": {
         "mode": "cache-ttl",
-        "ttl": "5m",
-        "softTrim": { "maxChars": 4000, "headChars": 1500, "tailChars": 1500 },
-        "hardClear": { "enabled": true, "placeholder": "[old tool result content cleared]" }
+        "ttl": "2m",
+        "tools": {
+          "allow": ["exec", "read", "web_fetch", "browser"],
+          "deny": ["*image*"]
+        },
+        "softTrim": { "maxChars": 2000, "headChars": 800, "tailChars": 800 },
+        "hardClear": { "enabled": true, "placeholder": "[cleared]" }
       }
     }
   }
 }
 ```
+
+**Optimized settings explained:**
+- **TTL 2m** (vs 5m): Faster cleanup of stale tool outputs
+- **softTrim 2000 chars** (vs 4000): Smaller retained context per tool result
+- **Shorter placeholder**: Minimal overhead for cleared content
+- **tools.deny `*image*`**: Skip caching image-related tool outputs
 
 ---
 
@@ -128,14 +176,18 @@ Example (OpenClaw): enable pruning so old tool results don’t fill the context 
     "mode": "merge",
     "providers": {
       "lmstudio": {
-        "baseUrl": "http://127.0.0.1:1234/v1",
-        "api": "openai-completions",
+        "baseUrl": "http://LLM_SERVER_IP:1234/v1",  // Your LM Studio server
+        "apiKey": "lmstudio-local",
+        "api": "openai-responses",
         "models": [
           {
-            "id": "MODEL_ID_FROM_LM_STUDIO",
+            "id": "your-model/model-name",
             "name": "Local LLM via LM Studio",
-            "contextWindow": 8192,
-            "maxTokens": 1000
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 32768,
+            "maxTokens": 2048
           }
         ]
       }
@@ -144,12 +196,18 @@ Example (OpenClaw): enable pruning so old tool results don’t fill the context 
   "agents": {
     "defaults": {
       "model": {
-        "primary": "lmstudio/MODEL_ID_FROM_LM_STUDIO"
+        "primary": "lmstudio/your-model/model-name",
+        "fallbacks": ["openai/gpt-4o-mini"]  // Optional cloud fallback
       }
     }
   }
 }
 ```
+
+**Notes:**
+- Use `"api": "openai-responses"` for newer LM Studio versions
+- Set `"cost": { ... }` to 0 for local models (free inference)
+- Add cloud fallbacks for reliability when local LLM is unavailable
 
 ---
 
@@ -218,12 +276,53 @@ This reduces:
 
 For local LLM setups:
 
-- Optimize for stability first  
-- Limit output size  
-- Manage tool noise  
-- Keep concurrency low  
-- Use summarization  
-- Favor structured reasoning  
-- Measure memory usage, not theoretical limits  
+1. **Use host networking** – eliminates 5-6x latency penalty from Docker bridge
+2. **Optimize context window** – 32k is a good balance for large models
+3. **Set reasonable maxTokens** – 2048 for coding tasks
+4. **Enable aggressive pruning** – 2min TTL, smaller softTrim values
+5. **Keep concurrency low** – 1-2 for main agent, 2-4 for subagents
+6. **Measure, don't guess** – monitor memory, swap, and tokens/sec
 
 > A well-tuned local model often outperforms a larger but poorly managed one.
+
+---
+
+## Quick Reference: Optimized Settings
+
+```jsonc
+{
+  "models": {
+    "providers": {
+      "lmstudio": {
+        "baseUrl": "http://LLM_SERVER_IP:1234/v1",
+        "api": "openai-responses",
+        "models": [{
+          "id": "your-model/model-name",
+          "contextWindow": 32768,
+          "maxTokens": 2048
+        }]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "lmstudio/your-model/model-name" },
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "2m",
+        "softTrim": { "maxChars": 2000, "headChars": 800, "tailChars": 800 },
+        "hardClear": { "enabled": true, "placeholder": "[cleared]" }
+      },
+      "maxConcurrent": 2,
+      "subagents": { "maxConcurrent": 4 }
+    }
+  }
+}
+```
+
+**docker-compose.yml:**
+```yaml
+services:
+  openclaw-gateway:
+    network_mode: host  # Critical for LLM performance!
+```

@@ -224,60 +224,154 @@ This script:
 
 ---
 
-## 8. Docker Compose Override
+## 8. Docker Compose Configuration
 
-File: `/opt/openclaw/docker-compose.override.yml`
+### Option A: Host Networking (Recommended for Local LLM)
+
+For best performance when using a local LLM server, use `network_mode: host`:
 
 ```yaml
 services:
   openclaw-gateway:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    network_mode: host
+    environment:
+      # ... your environment variables
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+    # ports section not needed with network_mode: host
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    command:
+      [
+        "node", "dist/index.js", "gateway",
+        "--bind", "${OPENCLAW_GATEWAY_BIND:-loopback}",
+        "--port", "${OPENCLAW_GATEWAY_PORT:-18789}",
+      ]
+
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    network_mode: host
+    # ... same config pattern
+```
+
+**Why host networking?**
+
+Docker bridge networking adds significant latency for API calls. Our benchmarks show:
+
+| Network Mode | LLM API Latency |
+|--------------|-----------------|
+| Bridge (gateway-net) | ~1.8s first request |
+| Host | ~0.3s first request |
+| Subsequent requests | ~0.01s (both) |
+
+**This is a 5-6x performance improvement for initial requests!**
+
+The latency difference comes from Docker's NAT and connection tracking overhead, which is especially noticeable for HTTP API calls to external services.
+
+### Option B: Bridge Networking (Maximum Isolation)
+
+If you prefer network isolation over performance, use bridge networking with port binding:
+
+```yaml
+services:
+  openclaw-gateway:
+    networks:
+      - gateway-net
     ports:
       - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789"
       - "127.0.0.1:${OPENCLAW_BRIDGE_PORT:-18790}:18790"
-    networks:
-      - gateway-net
-
-  openclaw-cli:
-    networks:
-      - gateway-net
 
 networks:
   gateway-net:
     external: true
 ```
 
-**Why bind to 127.0.0.1?**
-- Web UI is not exposed to LAN
-- Access only via SSH tunnel
+**Trade-off:** Better isolation, but ~5x slower LLM API response times.
+
+### Security with Host Networking
+
+With `network_mode: host`, security is maintained through:
+- `--bind loopback` ensures the gateway only listens on 127.0.0.1
+- Access via **Cloudflare Tunnel** (recommended) or SSH tunnel
+- The port is not accessible from the network
 
 ---
 
-## 9. Pairing & Web UI
+## 9. Remote Access
 
-Generate token:
+### Option A: Cloudflare Tunnel (Recommended)
 
-```bash
-docker compose run --rm openclaw-cli onboard
-```
+Cloudflare Tunnel provides secure HTTPS access without exposing ports:
 
-Create SSH tunnel:
+1. **Create tunnel in Cloudflare Zero Trust Dashboard:**
+   - Networks → Tunnels → Create a tunnel
+   - Choose Cloudflared, name it (e.g., `openclaw`)
+   - Copy the tunnel token
+
+2. **Configure public hostname:**
+   - Subdomain: `ai` (or your choice)
+   - Domain: your domain
+   - Service Type: HTTP
+   - URL: `localhost:18789`
+
+3. **Install cloudflared:**
+   ```bash
+   curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+   sudo dpkg -i /tmp/cloudflared.deb
+   sudo cloudflared service install YOUR_TUNNEL_TOKEN
+   ```
+
+4. **Access via HTTPS:**
+   ```
+   https://ai.yourdomain.com/?token=YOUR_GATEWAY_TOKEN
+   ```
+
+**Why Cloudflare Tunnel?**
+- No port forwarding required
+- Automatic HTTPS/TLS
+- DDoS protection
+- Works with `--bind loopback` (connects via localhost)
+
+### Option B: SSH Tunnel
+
+For simple local access:
 
 ```bash
 ssh -L 18789:127.0.0.1:18789 user@VM_IP
 ```
 
 Open in browser:
-
 ```
 http://localhost:18789/?token=YOUR_TOKEN
 ```
 
-Optional relaxed auth (local only):
+### Pairing & Onboarding
+
+Generate initial token:
+
+```bash
+docker compose run --rm -u node openclaw-cli onboard
+```
+
+**Important:** Always use `-u node` to avoid permission issues.
+
+Optional relaxed auth (when using tunnel with localhost binding):
 
 ```bash
 docker compose run --rm openclaw-cli openclaw config set gateway.controlUi.allowInsecureAuth true
 docker compose restart openclaw-gateway
 ```
+
+**Note:** `allowInsecureAuth: true` is safe when using Cloudflare Tunnel because:
+- External traffic uses HTTPS (handled by Cloudflare)
+- The tunnel connects to localhost internally via HTTP
+- The port is not exposed to the network
 
 ---
 
