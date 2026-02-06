@@ -14,33 +14,46 @@ graph TB
         APIs["External APIs<br/>(web, tools)"]
     end
 
+    subgraph LAN["Local Network"]
+        LLM["🖥 Local LLM Server<br/>(OpenAI-compatible API)<br/>e.g. LM Studio, Ollama"]
+    end
+
     subgraph VM["Virtual Machine (Ubuntu)"]
         subgraph Host["Host (native)"]
             Browser["Browser / SSH Tunnel"]
+            Telegram["Telegram / WhatsApp<br/>(channel messages)"]
             Gateway["OpenClaw Gateway<br/>systemd user service<br/>127.0.0.1:18789"]
             Brew["Homebrew<br/>(skill install)"]
         end
 
-        subgraph Docker["Docker (sandbox)"]
+        subgraph MainSession["Main Session (unsandboxed)"]
+            MainTools["Tools run on host<br/>full filesystem access<br/>direct network"]
+        end
+
+        subgraph Docker["Sandboxed Sessions (Docker)"]
             Sandbox["Sandbox Containers<br/>exec, read, write,<br/>edit, apply_patch"]
         end
 
-        FW{{"nftables firewall<br/>─────────────<br/>✓ Internet<br/>✓ DNS<br/>✗ Private LAN<br/>✗ LLM Server"}}
+        FW{{"nftables firewall<br/>─────────────<br/>✓ Internet<br/>✓ DNS (1.1.1.1, 8.8.8.8)<br/>✗ Private LAN<br/>✗ LLM Server"}}
     end
 
-    LLM["Local LLM Server<br/>(OpenAI-compatible API)"]
-
     Browser -->|loopback only| Gateway
-    Gateway -->|spawns & manages| Sandbox
-    Gateway ==>|direct host network<br/>no NAT overhead| LLM
+    Telegram -->|webhook / polling| Gateway
+    Gateway -->|"your terminal / webchat<br/>(trusted, no sandbox)"| MainSession
+    Gateway -->|"channel sessions<br/>(isolated per session)"| Sandbox
+    Gateway ==>|"direct host network<br/>no NAT · ~0.3s latency"| LLM
+    MainTools -->|direct| APIs
+    MainTools -->|direct| LLM
     Sandbox --> FW
     FW -->|allowed| APIs
     FW -.->|blocked| LLM
 
     style FW fill:#f9f,stroke:#333,stroke-width:2px
     style Gateway fill:#4a9,stroke:#333,color:#fff
+    style MainSession fill:#2a7,stroke:#333,color:#fff
     style Sandbox fill:#f80,stroke:#333,color:#fff
     style LLM fill:#48f,stroke:#333,color:#fff
+    style MainTools fill:#2a7,stroke:#333,color:#fff
 ```
 
 This document describes a secure and reproducible reference architecture for running OpenClaw **natively via NPM** inside a virtual machine:
