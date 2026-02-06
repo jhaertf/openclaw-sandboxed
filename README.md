@@ -363,6 +363,31 @@ sudo nft -f /etc/nftables.conf
 sudo systemctl enable nftables
 ```
 
+### Docker DNS Configuration (Required)
+
+Since the firewall blocks all private IPs, Docker containers can no longer reach your LAN's default DNS resolver (which is typically a private IP like your router). You must configure Docker to use the same public resolvers allowed by the firewall.
+
+File: `/etc/docker/daemon.json`
+
+```json
+{
+  "dns": ["1.1.1.1", "8.8.8.8"]
+}
+```
+
+```bash
+sudo systemctl restart docker
+```
+
+Verify containers use the correct DNS:
+
+```bash
+docker run --rm alpine grep nameserver /etc/resolv.conf
+# Expected: 1.1.1.1 and 8.8.8.8
+```
+
+> **Why this is needed:** Without this, Docker inherits the host's DNS configuration, which typically points to a private LAN address. The nftables rules correctly block all private ranges — including that DNS server. By explicitly setting Docker's DNS to the same public resolvers allowed in the `dns_servers` set, DNS resolution works without weakening the firewall.
+
 ### Why This Works
 
 Since the gateway runs **natively on the host** (not in Docker), the firewall rules only affect Docker containers (sandbox). The gateway communicates with the LLM server directly via the host network stack — no NAT, no firewall restrictions, no latency penalty.
