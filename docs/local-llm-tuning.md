@@ -12,9 +12,9 @@ This section summarizes best-practice settings and trade-offs for local LLM depl
 
 ---
 
-### 0. Docker Networking Impact (Critical!)
+### 0. Docker Networking Impact (Docker Compose only)
 
-**This is often the biggest performance factor.**
+> **Note:** This section is only relevant if you run the gateway inside Docker (i.e. the [docker-compose branch](https://github.com/jhaertf/openclaw-sandboxed/tree/docker-compose)). If you use the **native NPM setup** described in the main README, the gateway already runs directly on the host — there is no NAT overhead and no networking changes are needed.
 
 Docker bridge networking adds significant latency for API calls to external services (like your LLM server):
 
@@ -23,7 +23,7 @@ Docker bridge networking adds significant latency for API calls to external serv
 | Bridge (`gateway-net`) | ~1.8s | ~0.01s |
 | Host (`network_mode: host`) | ~0.3s | ~0.01s |
 
-**Recommendation:** Use `network_mode: host` in your docker-compose.yml for 5-6x faster initial response times.
+**Recommendation (Docker Compose only):** Use `network_mode: host` in your docker-compose.yml for 5-6x faster initial response times.
 
 ```yaml
 services:
@@ -276,7 +276,7 @@ This reduces:
 
 For local LLM setups:
 
-1. **Use host networking** – eliminates 5-6x latency penalty from Docker bridge
+1. **Use host networking** (Docker Compose only) – eliminates 5-6x latency penalty from Docker bridge; native NPM has no NAT overhead by default
 2. **Optimize context window** – 32k is a good balance for large models
 3. **Set reasonable maxTokens** – 2048 for coding tasks
 4. **Enable aggressive pruning** – 2min TTL, smaller softTrim values
@@ -320,7 +320,7 @@ For local LLM setups:
 }
 ```
 
-**docker-compose.yml:**
+**docker-compose.yml (Docker Compose branch only — not needed for native NPM):**
 ```yaml
 services:
   openclaw-gateway:

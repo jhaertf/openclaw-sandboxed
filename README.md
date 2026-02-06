@@ -319,18 +319,23 @@ table inet oc_sandbox {
     }
   }
 
+  set dns_servers {
+    type ipv4_addr
+    elements = { 1.1.1.1, 8.8.8.8 }
+  }
+
   chain forward {
     type filter hook forward priority 0; policy accept;
 
     # Allow Docker-internal traffic
     iifname "docker0" oifname "docker0" accept
 
-    # Allow DNS from sandbox (required for internet access)
-    iifname "docker0" tcp dport 53 accept
-    iifname "docker0" udp dport 53 accept
-
-    # Block sandbox access to ALL private networks
+    # Block sandbox access to ALL private networks (before DNS!)
     iifname "docker0" ip daddr @private_ipv4 drop
+
+    # Allow DNS only to explicit public resolvers
+    iifname "docker0" ip daddr @dns_servers tcp dport 53 accept
+    iifname "docker0" ip daddr @dns_servers udp dport 53 accept
 
     # Allow everything else (internet)
     iifname "docker0" accept
