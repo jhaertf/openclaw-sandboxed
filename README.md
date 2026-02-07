@@ -299,6 +299,93 @@ Edit `~/.openclaw/openclaw.json` and apply these security settings:
 
 > `mode: "non-main"` means your direct terminal/webchat session runs on the host (full access), while Telegram and other channel sessions run isolated in Docker containers.
 
+### Credential & Secret Management
+
+Secrets (API keys, bot tokens, auth tokens) should **never** be stored in `openclaw.json`. The config file may end up in backups, version control, or diagnostic dumps. Instead, use environment variables and token files.
+
+#### Telegram Bot Token → Token File
+
+Store the bot token in a dedicated file with strict permissions:
+
+```bash
+# Create credentials directory (if not exists)
+mkdir -p ~/.openclaw/credentials
+chmod 700 ~/.openclaw/credentials
+
+# Write token to file
+echo -n "<YOUR_BOT_TOKEN>" > ~/.openclaw/credentials/telegram-bot-token
+chmod 600 ~/.openclaw/credentials/telegram-bot-token
+```
+
+Reference it in `openclaw.json` via `tokenFile` instead of `botToken`:
+
+```jsonc
+{
+  "channels": {
+    "telegram": {
+      "tokenFile": "/home/openclaw/.openclaw/credentials/telegram-bot-token"
+      // NOT: "botToken": "1234:ABC..."
+    }
+  }
+}
+```
+
+#### Gateway Auth Token → Environment Variable
+
+The gateway reads its auth token from `OPENCLAW_GATEWAY_TOKEN`. Remove the token from the config and set it in the systemd service instead:
+
+```jsonc
+// openclaw.json — token omitted, mode is enough
+{
+  "gateway": {
+    "auth": {
+      "mode": "token"
+    }
+  }
+}
+```
+
+```ini
+# ~/.config/systemd/user/openclaw-gateway.service
+Environment=OPENCLAW_GATEWAY_TOKEN=<YOUR_LONG_RANDOM_TOKEN>
+```
+
+#### Brave Search API Key → Environment Variable
+
+OpenClaw reads the search API key from the `BRAVE_API_KEY` environment variable. Remove `apiKey` from the config:
+
+```jsonc
+// openclaw.json — no apiKey field
+{
+  "tools": {
+    "web": {
+      "search": {
+        "enabled": true,
+        "maxResults": 5
+      }
+    }
+  }
+}
+```
+
+```ini
+# ~/.config/systemd/user/openclaw-gateway.service
+Environment=BRAVE_API_KEY=<YOUR_BRAVE_API_KEY>
+```
+
+> **Warning:** The environment variable is `BRAVE_API_KEY` — **not** `OPENCLAW_WEB_SEARCH_API_KEY` or any other variant. OpenClaw silently ignores unknown env vars, so using the wrong name means search works in config but breaks after moving to env vars.
+
+#### File Permission Checklist
+
+```bash
+chmod 700 ~/.openclaw/
+chmod 600 ~/.openclaw/openclaw.json
+chmod 700 ~/.openclaw/credentials/
+chmod 600 ~/.openclaw/credentials/*
+chmod 600 ~/.openclaw/agents/*/agent/auth-profiles.json
+chmod 600 ~/.openclaw/agents/*/sessions/sessions.json
+```
+
 ### Verify Security
 
 ```bash
@@ -809,7 +896,81 @@ openclaw security audit --deep
 
 ---
 
-## 15. Common Issues
+## 15. Cron Jobs & Automation
+
+OpenClaw includes a built-in cron scheduler for recurring tasks. Cron jobs can run agent prompts on a schedule and deliver the results to Telegram, WhatsApp, or other channels.
+
+### Creating Cron Jobs
+
+Jobs are created via the CLI:
+
+```bash
+# Recurring job — daily at 8 AM, delivered to a Telegram group topic
+openclaw cron add \
+  --name "Daily News" \
+  --cron "0 8 * * *" \
+  --tz "Europe/Berlin" \
+  --session isolated \
+  --wake now \
+  --message "Summarize today's top 5 news stories." \
+  --announce \
+  --channel telegram \
+  --to "-100XXXXXXXXXX:topic:123"
+
+# One-shot reminder — fires once in 20 minutes, then auto-deletes
+openclaw cron add \
+  --name "Reminder" \
+  --at "20m" \
+  --session main \
+  --system-event "Reminder: check backup status" \
+  --wake now \
+  --delete-after-run
+```
+
+You can also ask the bot directly in Telegram to create cron jobs — the agent has access to the `cron.add` tool and knows the current chat context (group ID, topic ID).
+
+### Telegram Delivery Targets
+
+| Target Type | `--to` Format | Example |
+|-------------|---------------|---------|
+| DM to user | `<user_id>` | `5255580010` |
+| Group chat | `<group_id>` | `-1001234567890` |
+| Group topic | `<group_id>:topic:<id>` | `"-1001234567890:topic:123"` |
+
+### Key Concepts
+
+| Setting | Options | Effect |
+|---------|---------|--------|
+| `--session` | `main` / `isolated` | `isolated` = fresh context, required for `--announce` delivery |
+| `--wake` | `now` / `next-heartbeat` | `now` = fires at exact schedule; `next-heartbeat` = batches with 30-min heartbeat cycle |
+| `--announce` | flag | Delivers agent summary to the specified `--channel` + `--to` |
+
+> **Important:** Only **scheduled runs** deliver to channels. `openclaw cron run --force` executes the agent but **skips the delivery step**. Use `--force` only for debugging the agent prompt, not for testing delivery.
+
+### Managing Jobs
+
+```bash
+openclaw cron list                    # List all jobs
+openclaw cron runs --id <job-id>      # Show run history
+openclaw cron edit <job-id> --wake now  # Change settings
+openclaw cron disable <job-id>        # Pause a job
+openclaw cron rm <job-id>             # Delete a job
+```
+
+---
+
+## 16. Known Version-Specific Issues
+
+| Version | Issue | Severity | Fix |
+|---------|-------|----------|-----|
+| v2026.2.3-1 | Cron scheduler timer never fires ([PR #3335](https://github.com/openclaw/openclaw/pull/3335)) | Critical | Update to v2026.2.4+ |
+| v2026.2.3-1 | `cron run --force` skips delivery silently | By design | Use scheduled runs for delivery testing |
+
+> **Recommendation:** Always check the [OpenClaw releases](https://github.com/openclaw/openclaw/releases) and [community reports](https://www.answeroverflow.com/) for known issues before debugging unexpected behavior.
+
+---
+
+## 17. Common Issues
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
@@ -817,28 +978,34 @@ openclaw security audit --deep
 | LLM unreachable | Wrong IP or firewall | Check host can reach LLM: `curl http://<IP>:1234/v1/models` |
 | Slow LLM responses | Concurrent requests queue on LLM | Reduce `maxConcurrent` to 1-2 |
 | Docker permission denied | User not in docker group | `sudo usermod -aG docker openclaw && newgrp docker` |
-| Skill install fails | Homebrew not installed | See Section 10 |
+| Skill install fails | Homebrew not installed | See Section 11 |
 | Telegram 409 Conflict | Same bot token on multiple instances | Only run one instance per bot token |
 | `openclaw-gateway` won't start | Port already in use | Check `ss -tlnp \| grep 18789` |
+| Brave Search not working | Wrong env var name | Must be `BRAVE_API_KEY`, not `OPENCLAW_WEB_SEARCH_API_KEY` |
+| Cron jobs never fire (v2026.2.3) | [Known bug](https://github.com/openclaw/openclaw/pull/3335): scheduler timer callback never executes | Update to v2026.2.4+ (`npm update -g openclaw`) |
+| Cron `--force` doesn't deliver | By design: `--force` runs the agent but skips channel delivery | Wait for a scheduled run or trigger via the bot in Telegram |
+| Cron shows "not-due" | `nextRunAtMs` is in the future; forced runs shift the window | Use `--force` to bypass, or wait for the schedule |
 
 ---
 
-## 16. Local LLM Tuning (LM Studio)
+## 18. Local LLM Tuning (LM Studio)
 
 See: [Local LLM Tuning](docs/local-llm-tuning.md)
 
 ---
 
-## Result
+## 19. Result
 
 This setup provides:
 
 - Isolated tool execution (Docker sandbox)
 - Secure gateway (loopback only, token auth)
+- Secrets out of config (env vars + token files)
 - Local LLM with zero NAT latency (native host networking)
 - Firewall-enforced LAN isolation for sandboxed tools
 - Internet access for tools (APIs, web fetching)
 - Optional Telegram integration with allowlist policy
+- Scheduled automation via cron with channel delivery
 - Optional remote access via Cloudflare Tunnel or SSH
 - Reproducible deployment via NPM + systemd
 
