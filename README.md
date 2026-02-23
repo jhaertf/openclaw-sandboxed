@@ -176,6 +176,48 @@ docker pull debian:bookworm-slim
 docker tag debian:bookworm-slim openclaw-sandbox:bookworm-slim
 ```
 
+### Custom Sandbox Image (Recommended)
+
+The default `bookworm-slim` image is extremely minimal — no `pip`, no Python packages beyond the standard library. If your skills or cron jobs use Python scripts that need third-party packages (e.g. `requests`), build a custom image:
+
+Create `~/.openclaw/sandbox/Dockerfile`:
+
+```dockerfile
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl wget python3 python3-pip ca-certificates jq procps \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --break-system-packages requests
+```
+
+Build:
+
+```bash
+docker build -t openclaw-sandbox:custom ~/.openclaw/sandbox/
+```
+
+Then reference it in `openclaw.json`:
+
+```jsonc
+{
+  "agents": {
+    "defaults": {
+      "sandbox": {
+        "docker": {
+          "image": "openclaw-sandbox:custom"
+        }
+      }
+    }
+  }
+}
+```
+
+> **Note:** After rebuilding the image, remove the old sandbox container and restart the gateway so it picks up the new image:
+> ```bash
+> docker rm -f $(docker ps -aq --filter "name=openclaw-sbx")
+> systemctl --user restart openclaw-gateway
+> ```
+
 ---
 
 ## 6. Install OpenClaw
@@ -281,10 +323,16 @@ Edit `~/.openclaw/openclaw.json` and apply these security settings:
     "defaults": {
       "sandbox": {
         "mode": "non-main",       // Sandbox non-main sessions (Telegram, groups)
-        "scope": "session",       // One container per session
+        "scope": "agent",         // One container per agent (shared across sessions)
         "workspaceAccess": "rw",  // Read-write workspace access
         "docker": {
-          "network": "bridge"     // Default Docker bridge
+          "image": "openclaw-sandbox:custom",  // Or "openclaw-sandbox:bookworm-slim"
+          "network": "bridge",                 // Default Docker bridge
+          "user": "1000:1000",                 // Run as openclaw user (UID:GID)
+          "binds": [
+            "/home/openclaw/.openclaw/credentials:/home/openclaw/.openclaw/credentials:ro",
+            "/home/openclaw/.openclaw/workspace:/home/openclaw/.openclaw/workspace:rw"
+          ]
         }
       }
     }
@@ -298,6 +346,21 @@ Edit `~/.openclaw/openclaw.json` and apply these security settings:
 ```
 
 > `mode: "non-main"` means your direct terminal/webchat session runs on the host (full access), while Telegram and other channel sessions run isolated in Docker containers.
+
+**Container user mapping (`user: "1000:1000"`):**
+
+By default, sandbox containers run as root (UID 0). This causes permission errors when the container tries to read credential files that are `chmod 600` and owned by the `openclaw` user (UID 1000). Setting `"user": "1000:1000"` makes the container process run as the same UID/GID as the host `openclaw` user, so file permissions work correctly.
+
+**Bind mounts:**
+
+- **Credentials** (`ro`): Mounted read-only so sandbox tools can read API tokens and secrets without being able to modify them.
+- **Workspace** (`rw`): Mounted read-write so agents can access skills, scripts, memory files, and write output.
+
+> **Important:** After changing sandbox config, remove the old container and restart the gateway:
+> ```bash
+> docker rm -f $(docker ps -aq --filter "name=openclaw-sbx")
+> systemctl --user restart openclaw-gateway
+> ```
 
 ### Credential & Secret Management
 
@@ -349,6 +412,8 @@ The gateway reads its auth token from `OPENCLAW_GATEWAY_TOKEN`. Remove the token
 # ~/.config/systemd/user/openclaw-gateway.service
 Environment=OPENCLAW_GATEWAY_TOKEN=<YOUR_LONG_RANDOM_TOKEN>
 ```
+
+> **Important:** Never store the gateway token in `openclaw.json`. The systemd environment variable `OPENCLAW_GATEWAY_TOKEN` overrides the config value, so having the token in both places leads to `device_token_mismatch` errors when they inevitably drift apart (e.g. after a token rotation). Keep the token exclusively in the systemd service file and only set `"mode": "token"` in the config.
 
 #### Brave Search API Key → Environment Variable
 
@@ -857,7 +922,74 @@ Access: `http://localhost:18789/?token=<YOUR_TOKEN>`
 
 ---
 
-## 13. Operations
+## 13. Device Pairing
+
+OpenClaw uses a device pairing system to authenticate clients (browser, CLI, internal services). Each client generates a keypair and registers with the gateway.
+
+### How Pairing Works
+
+| Connection Source | Approval |
+|-------------------|----------|
+| Loopback (127.0.0.1) | Auto-approved |
+| LAN / Tailscale / Remote | Manual approval required |
+
+- **CLI** connections from localhost are automatically paired and approved
+- **Browser** connections are approved via the Control UI using the gateway token
+- Paired devices are stored in `~/.openclaw/devices/paired.json`
+
+### Scopes
+
+Each paired device has a set of scopes that control what it can do. The internal `gateway-client` (used for SubAgent announce delivery to channels) needs these scopes:
+
+| Scope | Purpose |
+|-------|---------|
+| `operator.admin` | Administrative operations |
+| `operator.approvals` | Approve/reject pairing requests |
+| `operator.pairing` | Initiate pairing |
+| `operator.read` | Read operations |
+| `operator.write` | **Required for announce delivery** (cron → Telegram) |
+
+> **Common issue:** If cron jobs run but announce delivery fails with "pairing required", the internal device is likely missing the `operator.write` scope. Check `~/.openclaw/devices/paired.json` and add it manually if needed.
+
+### Browser Pairing
+
+The browser caches its device identity in **IndexedDB** (not just LocalStorage). If pairing gets stuck:
+
+1. Chrome DevTools → Application → Storage → **"Clear site data"** (clears everything including IndexedDB)
+2. Or use an Incognito/Private window
+3. Reconnect and enter the gateway token
+
+> Simply clearing LocalStorage is **not sufficient** — the browser will keep sending the stale device identity from IndexedDB.
+
+### Pairing Reset (Nuclear Option)
+
+If pairing is completely broken and no client can connect:
+
+```bash
+systemctl --user stop openclaw-gateway
+
+# Remove device identity (forces regeneration)
+rm ~/.openclaw/identity/device.json
+rm ~/.openclaw/identity/device-auth.json
+
+# Clear all paired devices
+echo '{}' > ~/.openclaw/devices/paired.json
+echo '{}' > ~/.openclaw/devices/pending.json
+
+systemctl --user start openclaw-gateway
+```
+
+After reset:
+1. CLI connections via localhost are auto-approved again
+2. Browser: clear **all site data** (including IndexedDB), then reconnect
+3. Enter gateway token in the Control UI
+4. Verify `operator.write` scope is present in `paired.json` for the internal client
+
+> **Break-glass option:** If nothing works, temporarily set `gateway.controlUi.dangerouslyDisableDeviceAuth: true` in `openclaw.json`, connect the browser, then **immediately remove** the setting and restart the gateway.
+
+---
+
+## 14. Operations
 
 | Task | Command |
 |------|---------|
@@ -872,7 +1004,7 @@ Access: `http://localhost:18789/?token=<YOUR_TOKEN>`
 
 ---
 
-## 14. Functional Tests
+## 15. Functional Tests
 
 ```bash
 # 1. Gateway is listening on localhost only
@@ -896,7 +1028,7 @@ openclaw security audit --deep
 
 ---
 
-## 15. Cron Jobs & Automation
+## 16. Cron Jobs & Automation
 
 OpenClaw includes a built-in cron scheduler for recurring tasks. Cron jobs can run agent prompts on a schedule and deliver the results to Telegram, WhatsApp, or other channels.
 
@@ -959,7 +1091,7 @@ openclaw cron rm <job-id>             # Delete a job
 
 ---
 
-## 16. Known Version-Specific Issues
+## 17. Known Version-Specific Issues
 
 | Version | Issue | Severity | Fix |
 |---------|-------|----------|-----|
@@ -970,7 +1102,7 @@ openclaw cron rm <job-id>             # Delete a job
 
 ---
 
-## 17. Common Issues
+## 18. Common Issues
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
@@ -985,25 +1117,32 @@ openclaw cron rm <job-id>             # Delete a job
 | Cron jobs never fire (v2026.2.3) | [Known bug](https://github.com/openclaw/openclaw/pull/3335): scheduler timer callback never executes | Update to v2026.2.4+ (`npm update -g openclaw`) |
 | Cron `--force` doesn't deliver | By design: `--force` runs the agent but skips channel delivery | Wait for a scheduled run or trigger via the bot in Telegram |
 | Cron shows "not-due" | `nextRunAtMs` is in the future; forced runs shift the window | Use `--force` to bypass, or wait for the schedule |
+| `device_token_mismatch` on all connections | Gateway token in systemd env var differs from `openclaw.json` | Remove token from config entirely; only set it in systemd env var |
+| Cron announce delivery fails ("pairing required") | Internal gateway-client missing `operator.write` scope | Add scope to `~/.openclaw/devices/paired.json` and restart |
+| Browser pairing stuck after reset | Browser caches device identity in IndexedDB | Clear **all site data** in DevTools (not just LocalStorage) |
+| `PermissionError` on credentials in sandbox | Container running as root (UID 0), files owned by openclaw (UID 1000) | Add `"user": "1000:1000"` to sandbox docker config |
+| Sandbox scripts can't find workspace files | Workspace directory not mounted in container | Add workspace bind mount to `sandbox.docker.binds` |
+| Old sandbox image used after rebuild | Stale container still running with old image | `docker rm -f $(docker ps -aq --filter "name=openclaw-sbx")` then restart gateway |
 
 ---
 
-## 18. Local LLM Tuning (LM Studio)
+## 19. Local LLM Tuning (LM Studio)
 
 See: [Local LLM Tuning](docs/local-llm-tuning.md)
 
 ---
 
-## 19. Result
+## 20. Result
 
 This setup provides:
 
-- Isolated tool execution (Docker sandbox)
+- Isolated tool execution (Docker sandbox with UID mapping)
 - Secure gateway (loopback only, token auth)
 - Secrets out of config (env vars + token files)
 - Local LLM with zero NAT latency (native host networking)
 - Firewall-enforced LAN isolation for sandboxed tools
 - Internet access for tools (APIs, web fetching)
+- Device pairing with auto-approve on loopback
 - Optional Telegram integration with allowlist policy
 - Scheduled automation via cron with channel delivery
 - Optional remote access via Cloudflare Tunnel or SSH
